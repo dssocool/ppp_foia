@@ -10,12 +10,8 @@
 
 1. Upload `ppp_foia_to_eventhouse.py` to your Lakehouse **Files**.
 2. Upload the full PPP CSV to Fabric (already done per your environment).
-3. Open an Eventhouse-related notebook; set in `ppp_foia_to_eventhouse.py`:
-   - `CSV_PATH` — base folder (loads all `.csv` files from the latest subfolder) or a single `.csv` path
-   - `KUSTO_URI`, `KUSTO_DATABASE` — from Eventhouse database details
-   - `KUSTO_TABLE`, `STAGING_TABLE`
-
-## Run
+3. In a **prior notebook cell**, set `CSV_PATH`, `KUSTO_URI`, `KUSTO_DATABASE`, `KUSTO_TABLE`, `STAGING_TABLE`, and optionally `SPARK_SHUFFLE_PARTITIONS` / `ROW_LIMIT`.
+4. Open an Eventhouse-related notebook and `%run` the script:
 
 ```python
 %run ppp_foia_to_eventhouse

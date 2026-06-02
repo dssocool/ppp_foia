@@ -1,28 +1,16 @@
 """
 PPP FOIA CSV → Fabric Eventhouse (KQL) pipeline.
 
-Run in a Fabric notebook (PySpark). Copy this file into the notebook workspace or
-%run it after uploading to Lakehouse Files.
+Run in a Fabric notebook (PySpark). Set CSV_PATH, KUSTO_URI, etc. in a cell
+before %run; then call run_pipeline(spark).
 
-Full refresh: writes STAGING_TABLE, then run the KQL cell at the bottom (or
-execute replace_eventhouse_table()) to .set-or-replace into KUSTO_TABLE.
+Full refresh: writes staging table, then run the printed KQL to .set-or-replace
+into the target Eventhouse table.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Fabric configuration — update before running
-# ---------------------------------------------------------------------------
-CSV_PATH = "Files/ppp_foia"  # Base folder: latest subfolder's *.csv files are loaded
-KUSTO_URI = ""  # Eventhouse Query URI, e.g. https://<id>.kusto.fabric.microsoft.com
-KUSTO_DATABASE = ""  # KQL database name
-KUSTO_TABLE = "ppp_loans"
-STAGING_TABLE = "ppp_loans_staging"
-SPARK_SHUFFLE_PARTITIONS = 200
-# Set to a positive int to limit rows when testing (e.g. with ppp_foia_sample.csv)
-ROW_LIMIT: int | None = None
 
 # ---------------------------------------------------------------------------
 # Imports (Fabric notebook provides `spark` and `mssparkutils`)
@@ -113,12 +101,41 @@ PROCEED_COLUMNS = (
     ("DEBT_INTEREST_PROCEED", "DebtInterestDisplay"),
 )
 
+# Markers Fabric uses when mssparkutils.fs.ls returns absolute mount paths.
+_LAKEHOUSE_FILE_MARKERS = ("/Files/", "/files/")
+
+
+def _normalize_fabric_path(path: str) -> str:
+    """
+    Normalize paths for mssparkutils.fs and Spark in Fabric.
+
+    mssparkutils.fs.ls often returns absolute mount paths like
+    /lakehouse/default/Files/... which fail on the next ls() unless prefixed
+    with file:. Prefer lakehouse-relative paths (Files/...) when possible.
+    """
+    normalized = path.rstrip("/")
+    if normalized.startswith(("abfss://", "file:", "Files/", "Tables/")):
+        return normalized
+
+    if normalized.startswith("/"):
+        lower = normalized.lower()
+        for marker in _LAKEHOUSE_FILE_MARKERS:
+            idx = lower.find(marker.lower())
+            if idx != -1:
+                return "Files/" + normalized[idx + len(marker) :]
+        return f"file:{normalized}"
+
+    return normalized
+
 
 def _fs_list_dir(path: str) -> list[tuple[str, bool, float]]:
     """Return (entry_path, is_dir, modify_time) for each child of path."""
     try:
-        entries = mssparkutils.fs.ls(path)  # noqa: F821 — Fabric global
-        return [(entry.path, entry.isDir, float(entry.modifyTime)) for entry in entries]
+        entries = mssparkutils.fs.ls(_normalize_fabric_path(path))  # noqa: F821 — Fabric global
+        return [
+            (_normalize_fabric_path(entry.path), entry.isDir, float(entry.modifyTime))
+            for entry in entries
+        ]
     except NameError:
         base = Path(path)
         if not base.is_dir():
@@ -164,7 +181,7 @@ def resolve_csv_paths(csv_path: str) -> tuple[str, list[str]]:
     - Otherwise treat csv_path as a base directory, pick the latest subfolder
       (by modify time), and load every .csv file in that subfolder.
     """
-    normalized = csv_path.rstrip("/")
+    normalized = _normalize_fabric_path(csv_path)
     if normalized.lower().endswith(".csv"):
         return normalized, [normalized]
 
@@ -194,9 +211,14 @@ def _currency_display(amount_column):
     ).otherwise(F.concat(F.lit("$"), F.format_number(rounded, 0)))
 
 
-def read_ppp_csv(spark: SparkSession, csv_path: str, row_limit: int | None = None) -> DataFrame:
+def read_ppp_csv(
+    spark: SparkSession,
+    csv_path: str,
+    row_limit: int | None = None,
+    spark_shuffle_partitions: int = 200,
+) -> DataFrame:
     """Read PPP FOIA CSV(s) with explicit schema (no inferSchema)."""
-    spark.conf.set("spark.sql.shuffle.partitions", str(SPARK_SHUFFLE_PARTITIONS))
+    spark.conf.set("spark.sql.shuffle.partitions", str(spark_shuffle_partitions))
 
     source_dir, csv_files = resolve_csv_paths(csv_path)
     print(f"Reading {len(csv_files)} CSV file(s) from {source_dir}:")
@@ -373,12 +395,13 @@ def write_to_kusto_staging(
     kusto_uri: str,
     database: str,
     table: str,
+    spark_shuffle_partitions: int = 200,
 ) -> None:
     """Append transformed data to a KQL staging table."""
     access_token = mssparkutils.credentials.getToken(kusto_uri)  # noqa: F821 — Fabric global
 
     (
-        df.repartition(SPARK_SHUFFLE_PARTITIONS)
+        df.repartition(spark_shuffle_partitions)
         .write.format(KUSTO_FORMAT)
         .option("kustoCluster", kusto_uri)
         .option("kustoDatabase", database)
@@ -410,38 +433,53 @@ def run_pipeline(
     csv_path: str = CSV_PATH,
     kusto_uri: str = KUSTO_URI,
     kusto_database: str = KUSTO_DATABASE,
+    kusto_table: str = KUSTO_TABLE,
     staging_table: str = STAGING_TABLE,
     row_limit: int | None = ROW_LIMIT,
     write_staging: bool = True,
+    spark_shuffle_partitions: int | None = None,
 ) -> DataFrame:
     """Read CSV, transform, optionally write to KQL staging table."""
-    raw = read_ppp_csv(spark, csv_path, row_limit=row_limit)
+    if spark_shuffle_partitions is None:
+        spark_shuffle_partitions = globals().get("SPARK_SHUFFLE_PARTITIONS", 200)
+    raw = read_ppp_csv(
+        spark,
+        csv_path,
+        row_limit=row_limit,
+        spark_shuffle_partitions=spark_shuffle_partitions,
+    )
     df = transform_ppp(raw)
 
     if write_staging:
         if not kusto_uri or not kusto_database:
-            raise ValueError("Set KUSTO_URI and KUSTO_DATABASE before writing to Eventhouse")
+            raise ValueError("Set kusto_uri and kusto_database before writing to Eventhouse")
         print(f"Writing to staging table '{staging_table}'...")
         print("If re-running ingest, execute in KQL first:", kql_staging_clear_command(staging_table))
-        write_to_kusto_staging(df, kusto_uri, kusto_database, staging_table)
-        print(kql_full_refresh_commands(KUSTO_TABLE, staging_table))
+        write_to_kusto_staging(
+            df,
+            kusto_uri,
+            kusto_database,
+            staging_table,
+            spark_shuffle_partitions=spark_shuffle_partitions,
+        )
+        print(kql_full_refresh_commands(kusto_table, staging_table))
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Fabric notebook — in a PySpark cell after updating config above:
+# Fabric notebook — set config in a prior cell, then:
 #   %run ppp_foia_to_eventhouse
 #   df = run_pipeline(spark)
 #   df.show(5, truncate=False)
-# Then run the printed KQL in a %kql cell to .set-or-replace into KUSTO_TABLE.
+# Then run the printed KQL in a %kql cell.
 # ---------------------------------------------------------------------------
 
 # =============================================================================
 # VALIDATION (sample run)
 # =============================================================================
-# 1. Set CSV_PATH to a folder (latest subfolder's *.csv) or a single .csv file.
-# 2. Set write_staging=False to inspect locally:
+# 1. Set csv_path (CSV_PATH) to a folder or a single .csv file in a prior cell.
+# 2. Set write_staging=False to inspect:
 #      df = run_pipeline(spark, write_staging=False)
 # 3. Checks on sample data:
 #    - Recipient is uppercase (e.g. NORTH CHARLESTON HOSPITALITY GROUP LLC)
