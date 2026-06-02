@@ -10,6 +10,7 @@ to the target table. No staging table or separate KQL notebook cell.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -398,14 +399,127 @@ def get_kusto_access_token(kusto_uri: str) -> str:
         return mssparkutils.credentials.getToken("kusto")  # noqa: F821 — Fabric global
 
 
+_KUSTO_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_kusto_table_name(table: str) -> str:
+    if not _KUSTO_TABLE_NAME_RE.match(table):
+        raise ValueError(f"Invalid Kusto table name: {table!r}")
+    return table
+
+
+def _kusto_error_texts(exc: BaseException) -> list[str]:
+    """Collect human-readable fragments from Kusto exceptions (incl. nested API errors)."""
+    texts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        texts.append(str(current))
+        try:
+            from azure.kusto.data.exceptions import KustoApiError, KustoMultiApiError, KustoServiceError
+        except ImportError:
+            current = current.__cause__
+            continue
+
+        if isinstance(current, KustoApiError):
+            api_error = current.get_api_error()
+            for part in (api_error.code, api_error.message, api_error.description, api_error.type):
+                if part:
+                    texts.append(part)
+        elif isinstance(current, KustoMultiApiError):
+            for api_error in current.get_api_errors():
+                for part in (api_error.code, api_error.message, api_error.description, api_error.type):
+                    if part:
+                        texts.append(part)
+        elif isinstance(current, KustoServiceError):
+            texts.append(current.message_text)
+
+        current = current.__cause__
+
+    return texts
+
+
 def _is_kusto_table_not_found(exc: BaseException) -> bool:
-    message = str(exc).lower()
+    combined = " ".join(_kusto_error_texts(exc)).lower()
     return (
-        "doesn't exist" in message
-        or "does not exist" in message
-        or "notfound" in message
-        or "entitynotfound" in message
+        "badrequest_entitynotfound" in combined
+        or "entitynotfoundexception" in combined
+        or ("entity id" in combined and "was not found" in combined)
+        or "doesn't exist" in combined
+        or "does not exist" in combined
+        or "wasn't found" in combined
+        or "not found" in combined
+        or "unknown table" in combined
+        or "notfound" in combined
+        or "entitynotfound" in combined
     )
+
+
+def _import_kusto_client():
+    try:
+        from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
+    except ImportError as exc:
+        raise ImportError(
+            "Kusto management requires azure-kusto-data. "
+            "In Fabric: !pip install azure-kusto-data --quiet"
+        ) from exc
+    return KustoClient, KustoConnectionStringBuilder
+
+
+def _open_kusto_client(kusto_uri: str, access_token: str | None = None):
+    KustoClient, KustoConnectionStringBuilder = _import_kusto_client()
+    token = access_token or get_kusto_access_token(kusto_uri)
+    kcsb = KustoConnectionStringBuilder.with_aad_application_token_authentication(
+        kusto_uri, token
+    )
+    return KustoClient(kcsb), token
+
+
+def _spark_field_to_kql_type(field: StructField) -> str:
+    data_type = field.dataType
+    if isinstance(data_type, StringType):
+        return "string"
+    if isinstance(data_type, IntegerType):
+        return "int"
+    if isinstance(data_type, DoubleType):
+        return "real"
+    if isinstance(data_type, DateType):
+        return "datetime"
+    raise ValueError(f"Unsupported Spark type for Kusto: {field.name} ({data_type})")
+
+
+def _kusto_table_exists(client, database: str, table: str) -> bool:
+    table = _validate_kusto_table_name(table)
+    try:
+        client.execute_mgmt(database, f".show table {table} cslschema")
+        return True
+    except Exception as exc:
+        if _is_kusto_table_not_found(exc):
+            return False
+        raise
+
+
+def ensure_kusto_table(
+    client,
+    database: str,
+    table: str,
+    df: DataFrame,
+) -> bool:
+    """
+    Create the target table from the DataFrame schema when missing.
+
+    Returns True if a create command was issued, False if the table already existed.
+    """
+    table = _validate_kusto_table_name(table)
+    if _kusto_table_exists(client, database, table):
+        return False
+
+    columns = ", ".join(
+        f"{field.name}:{_spark_field_to_kql_type(field)}" for field in df.schema.fields
+    )
+    client.execute_mgmt(database, f".create-merge table {table} ({columns})")
+    return True
 
 
 def clear_kusto_table(
@@ -413,6 +527,8 @@ def clear_kusto_table(
     database: str,
     table: str,
     access_token: str | None = None,
+    *,
+    client=None,
 ) -> None:
     """
     Remove all rows from a KQL table via management API.
@@ -421,27 +537,28 @@ def clear_kusto_table(
     Requires azure-kusto-data in the notebook environment:
       !pip install azure-kusto-data --quiet
     """
-    try:
-        from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
-    except ImportError as exc:
-        raise ImportError(
-            "clear_kusto_table requires azure-kusto-data. "
-            "In Fabric: !pip install azure-kusto-data --quiet"
-        ) from exc
-
-    token = access_token or get_kusto_access_token(kusto_uri)
-    kcsb = KustoConnectionStringBuilder.with_aad_application_token_authentication(
-        kusto_uri, token
-    )
+    table = _validate_kusto_table_name(table)
     command = f".clear table {table} data"
 
-    with KustoClient(kcsb) as client:
+    if client is not None:
+        if not _kusto_table_exists(client, database, table):
+            return
         try:
             client.execute_mgmt(database, command)
         except Exception as exc:
             if _is_kusto_table_not_found(exc):
                 return
             raise
+        return
+
+    with _open_kusto_client(kusto_uri, access_token)[0] as kusto_client:
+        clear_kusto_table(
+            kusto_uri,
+            database,
+            table,
+            access_token=access_token,
+            client=kusto_client,
+        )
 
 
 def write_to_kusto_table(
@@ -476,17 +593,31 @@ def write_to_kusto_full_refresh(
     table: str,
     spark_shuffle_partitions: int = 200,
 ) -> None:
-    """Full refresh: clear target table, then append the DataFrame."""
-    token = get_kusto_access_token(kusto_uri)
-    clear_kusto_table(kusto_uri, database, table, access_token=token)
-    write_to_kusto_table(
-        df,
-        kusto_uri,
-        database,
-        table,
-        spark_shuffle_partitions=spark_shuffle_partitions,
-        access_token=token,
-    )
+    """Full refresh: clear existing table (if any), ensure table exists, then append."""
+    table = _validate_kusto_table_name(table)
+    client, token = _open_kusto_client(kusto_uri)
+    with client:
+        if _kusto_table_exists(client, database, table):
+            print(f"Clearing existing rows in '{table}'...")
+            clear_kusto_table(
+                kusto_uri,
+                database,
+                table,
+                access_token=token,
+                client=client,
+            )
+        else:
+            print(f"Table '{table}' not found; creating from DataFrame schema...")
+            ensure_kusto_table(client, database, table, df)
+
+        write_to_kusto_table(
+            df,
+            kusto_uri,
+            database,
+            table,
+            spark_shuffle_partitions=spark_shuffle_partitions,
+            access_token=token,
+        )
 
 
 def run_pipeline(
