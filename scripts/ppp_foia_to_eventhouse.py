@@ -4,8 +4,8 @@ PPP FOIA CSV → Fabric Eventhouse (KQL) pipeline.
 Run in a Fabric notebook (PySpark). Set CSV_PATH, KUSTO_URI, etc. in a cell
 before %run; then call run_pipeline(spark).
 
-Full refresh: writes staging table, then run the printed KQL to .set-or-replace
-into the target Eventhouse table.
+Full refresh: .clear table on the target (azure-kusto-data), then Spark append
+to the target table. No staging table or separate KQL notebook cell.
 """
 
 from __future__ import annotations
@@ -390,15 +390,70 @@ def transform_ppp(df: DataFrame) -> DataFrame:
     return df.select(*output_columns)
 
 
-def write_to_kusto_staging(
+def get_kusto_access_token(kusto_uri: str) -> str:
+    """Fabric AAD token for Kusto query/management APIs."""
+    try:
+        return mssparkutils.credentials.getToken(kusto_uri)  # noqa: F821 — Fabric global
+    except Exception:
+        return mssparkutils.credentials.getToken("kusto")  # noqa: F821 — Fabric global
+
+
+def _is_kusto_table_not_found(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "doesn't exist" in message
+        or "does not exist" in message
+        or "notfound" in message
+        or "entitynotfound" in message
+    )
+
+
+def clear_kusto_table(
+    kusto_uri: str,
+    database: str,
+    table: str,
+    access_token: str | None = None,
+) -> None:
+    """
+    Remove all rows from a KQL table via management API.
+
+    Skips quietly if the table does not exist yet (first run).
+    Requires azure-kusto-data in the notebook environment:
+      !pip install azure-kusto-data --quiet
+    """
+    try:
+        from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
+    except ImportError as exc:
+        raise ImportError(
+            "clear_kusto_table requires azure-kusto-data. "
+            "In Fabric: !pip install azure-kusto-data --quiet"
+        ) from exc
+
+    token = access_token or get_kusto_access_token(kusto_uri)
+    kcsb = KustoConnectionStringBuilder.with_aad_application_token_authentication(
+        kusto_uri, token
+    )
+    command = f".clear table {table} data"
+
+    with KustoClient(kcsb) as client:
+        try:
+            client.execute_mgmt(database, command)
+        except Exception as exc:
+            if _is_kusto_table_not_found(exc):
+                return
+            raise
+
+
+def write_to_kusto_table(
     df: DataFrame,
     kusto_uri: str,
     database: str,
     table: str,
     spark_shuffle_partitions: int = 200,
+    access_token: str | None = None,
 ) -> None:
-    """Append transformed data to a KQL staging table."""
-    access_token = mssparkutils.credentials.getToken(kusto_uri)  # noqa: F821 — Fabric global
+    """Append a DataFrame to a KQL table (Spark Kusto connector)."""
+    token = access_token or get_kusto_access_token(kusto_uri)
 
     (
         df.repartition(spark_shuffle_partitions)
@@ -406,7 +461,7 @@ def write_to_kusto_staging(
         .option("kustoCluster", kusto_uri)
         .option("kustoDatabase", database)
         .option("kustoTable", table)
-        .option("accessToken", access_token)
+        .option("accessToken", token)
         .option("tableCreateOptions", "CreateIfNotExist")
         .option("clientBatchingLimit", "1024")
         .mode("Append")
@@ -414,18 +469,24 @@ def write_to_kusto_staging(
     )
 
 
-def kql_staging_clear_command(staging_table: str) -> str:
-    """Clear staging before a re-run to avoid duplicate extents on append."""
-    return f".clear table {staging_table} data"
-
-
-def kql_full_refresh_commands(target_table: str, staging_table: str) -> str:
-    """Return KQL commands for a separate notebook cell (%kql) after staging ingest."""
-    return f"""
-// Run in a Fabric KQL cell after PySpark staging write completes.
-.set-or-replace {target_table} with (recreate_schema = true) <| {staging_table}
-.drop table {staging_table} ifexists
-""".strip()
+def write_to_kusto_full_refresh(
+    df: DataFrame,
+    kusto_uri: str,
+    database: str,
+    table: str,
+    spark_shuffle_partitions: int = 200,
+) -> None:
+    """Full refresh: clear target table, then append the DataFrame."""
+    token = get_kusto_access_token(kusto_uri)
+    clear_kusto_table(kusto_uri, database, table, access_token=token)
+    write_to_kusto_table(
+        df,
+        kusto_uri,
+        database,
+        table,
+        spark_shuffle_partitions=spark_shuffle_partitions,
+        access_token=token,
+    )
 
 
 def run_pipeline(
@@ -434,12 +495,15 @@ def run_pipeline(
     kusto_uri: str = KUSTO_URI,
     kusto_database: str = KUSTO_DATABASE,
     kusto_table: str = KUSTO_TABLE,
-    staging_table: str = STAGING_TABLE,
     row_limit: int | None = ROW_LIMIT,
-    write_staging: bool = True,
+    write_to_eventhouse: bool = True,
+    write_staging: bool | None = None,
     spark_shuffle_partitions: int | None = None,
 ) -> DataFrame:
-    """Read CSV, transform, optionally write to KQL staging table."""
+    """Read CSV, transform, optionally full-refresh write to the target KQL table."""
+    if write_staging is not None:
+        write_to_eventhouse = write_staging
+
     if spark_shuffle_partitions is None:
         spark_shuffle_partitions = globals().get("SPARK_SHUFFLE_PARTITIONS", 200)
     raw = read_ppp_csv(
@@ -450,49 +514,43 @@ def run_pipeline(
     )
     df = transform_ppp(raw)
 
-    if write_staging:
+    if write_to_eventhouse:
         if not kusto_uri or not kusto_database:
             raise ValueError("Set kusto_uri and kusto_database before writing to Eventhouse")
-        print(f"Writing to staging table '{staging_table}'...")
-        print("If re-running ingest, execute in KQL first:", kql_staging_clear_command(staging_table))
-        write_to_kusto_staging(
+        print(f"Full refresh: clear + append to '{kusto_table}'...")
+        write_to_kusto_full_refresh(
             df,
             kusto_uri,
             kusto_database,
-            staging_table,
+            kusto_table,
             spark_shuffle_partitions=spark_shuffle_partitions,
         )
-        print(kql_full_refresh_commands(kusto_table, staging_table))
 
     return df
 
 
 # ---------------------------------------------------------------------------
 # Fabric notebook — set config in a prior cell, then:
+#   !pip install azure-kusto-data --quiet   # once per environment
 #   %run ppp_foia_to_eventhouse
 #   df = run_pipeline(spark)
 #   df.show(5, truncate=False)
-# Then run the printed KQL in a %kql cell.
 # ---------------------------------------------------------------------------
 
 # =============================================================================
 # VALIDATION (sample run)
 # =============================================================================
 # 1. Set csv_path (CSV_PATH) to a folder or a single .csv file in a prior cell.
-# 2. Set write_staging=False to inspect:
-#      df = run_pipeline(spark, write_staging=False)
+# 2. Set write_to_eventhouse=False to inspect:
+#      df = run_pipeline(spark, write_to_eventhouse=False)
 # 3. Checks on sample data:
 #    - Recipient is uppercase (e.g. NORTH CHARLESTON HOSPITALITY GROUP LLC)
 #    - LoanStatusDisplay starts with "Forgiven as of" when ForgivenessDate is set
 #    - searchtext contains "synovus" and zip fragment "29456" for row 9677497701
 #
-# Full run: restore full CSV path, ROW_LIMIT=None, write_staging=True, then run KQL:
-#   .set-or-replace ppp_loans with (recreate_schema = true) <| ppp_loans_staging
-#   .drop table ppp_loans_staging ifexists
-#
-# Fallback if .set-or-replace is blocked:
-#   .clear table ppp_loans data
-#   then re-append directly to ppp_loans (skip staging).
+# Full run: restore full CSV path, ROW_LIMIT=None, write_to_eventhouse=True.
+# If the output schema changes, drop the target table once in Eventhouse query UI,
+# then re-run so CreateIfNotExist recreates it from the DataFrame schema.
 #
 # =============================================================================
 # POWER BI — single search bar on searchtext
