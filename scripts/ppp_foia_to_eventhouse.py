@@ -1,16 +1,32 @@
 """
-PPP FOIA CSV → Fabric Eventhouse (KQL) pipeline.
+PPP FOIA CSV → Fabric Eventhouse (KQL) + Lakehouse (Delta) pipeline.
 
-Run in a Fabric notebook (PySpark). Set CSV_PATH, KUSTO_URI, etc. in a cell
-before %run; then call run_pipeline(spark).
+Run in a Fabric notebook (PySpark). All configurable values live in the
+CONFIGURATION block below — edit them there (or override per call via
+run_pipeline(...) arguments). Then:
 
-Full refresh: .clear table on the target (azure-kusto-data), then Spark append
-to the target table. No staging table or separate KQL notebook cell.
+    download_dataset()          # pull the latest CSVs from data.sba.gov
+    df = run_pipeline(spark)    # read + transform + full-refresh both targets
+
+Source data: https://data.sba.gov/dataset/ppp-foia
+
+One transform feeds both sinks: the transformed Spark DataFrame is cached and
+materialized once, then written to the Eventhouse KQL table and the lakehouse
+Delta table (so the CSV read + transforms aren't recomputed per write).
+
+Full refresh: .clear table on the Eventhouse target (azure-kusto-data) then
+Spark append; overwrite (overwriteSchema) for the lakehouse Delta table.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -27,7 +43,53 @@ from pyspark.sql.types import (
     StructType,
 )
 
+# ===========================================================================
+# CONFIGURATION — edit these (or pass overrides to run_pipeline / download_*).
+# ===========================================================================
+
+# --- Source download (SBA PPP FOIA dataset on data.sba.gov / CKAN) ---------
+SBA_DATASET_PAGE_URL = "https://data.sba.gov/dataset/ppp-foia"
+# CKAN API used to discover the current resource (file) download URLs so the
+# date-suffixed filenames don't have to be hardcoded.
+SBA_CKAN_API_BASE = "https://data.sba.gov/api/3/action"
+SBA_DATASET_ID = "ppp-foia"
+
+# Where downloaded files land. Use a real/mounted path (open() writes here).
+# In Fabric, the default lakehouse Files folder is mounted at /lakehouse/default/Files.
+DOWNLOAD_DIR = "/lakehouse/default/Files/ppp_foia"
+# Resource formats to download (as reported by CKAN). Add "XLSX" to also grab
+# the "PPP Data Dictionary". Set to None/() to download every resource.
+DOWNLOAD_FORMATS = ("CSV",)
+DOWNLOAD_OVERWRITE = False  # re-download even if a same-size file already exists
+DOWNLOAD_FILE_LIMIT = None  # cap number of files (handy for a quick test)
+DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # streaming read/write chunk size
+DOWNLOAD_MAX_WORKERS = 8  # parallel file downloads (network I/O-bound)
+DOWNLOAD_BEFORE_RUN = False  # if True, run_pipeline() downloads first
+_DOWNLOAD_USER_AGENT = "ppp-foia-pipeline/1.0 (+https://data.sba.gov/dataset/ppp-foia)"
+
+# --- Source read (Spark) ----------------------------------------------------
+# Folder of CSVs, a base folder with dated subfolders, or a single .csv file.
+# Defaults to the download target so download_dataset() + run_pipeline() align.
+CSV_PATH = DOWNLOAD_DIR
+ROW_LIMIT = None  # set an int (e.g. 1000) for a sample run; None = all rows
+SPARK_SHUFFLE_PARTITIONS = 200
+
+# --- Target Eventhouse / KQL database --------------------------------------
+KUSTO_URI = ""  # e.g. "https://<cluster>.kusto.fabric.microsoft.com"
+KUSTO_DATABASE = ""  # Eventhouse / KQL database name
+KUSTO_TABLE = "ppp_loans"  # target KQL table
+WRITE_TO_EVENTHOUSE = True  # full-refresh write to the KQL table
+
 KUSTO_FORMAT = "com.microsoft.kusto.spark.synapse.datasource"
+
+# --- Target Lakehouse (Delta) table ----------------------------------------
+# Managed Delta table in the attached default lakehouse (Tables/<name>). Fed by
+# the SAME transformed Spark DataFrame as the Eventhouse write (see run_pipeline).
+LAKEHOUSE_TABLE = "ppp_loans"  # target Delta table name
+WRITE_TO_LAKEHOUSE = True  # full-refresh (overwrite) write to the Delta table
+
+# Sentinel so run_pipeline can tell "argument not passed" from an explicit None.
+_UNSET = object()
 
 # ---------------------------------------------------------------------------
 # Explicit Spark schema for SBA PPP FOIA CSV (53 columns)
@@ -93,14 +155,30 @@ PPP_SCHEMA = StructType(
 )
 
 PROCEED_COLUMNS = (
-    ("PAYROLL_PROCEED", "PayrollDisplay"),
-    ("UTILITIES_PROCEED", "UtilitiesDisplay"),
-    ("MORTGAGE_INTEREST_PROCEED", "MortgageInterestDisplay"),
-    ("HEALTH_CARE_PROCEED", "HealthCareDisplay"),
-    ("RENT_PROCEED", "RentDisplay"),
-    ("REFINANCE_EIDL_PROCEED", "RefinanceEidlDisplay"),
-    ("DEBT_INTEREST_PROCEED", "DebtInterestDisplay"),
+    ("PAYROLL_PROCEED", "Payroll_Display"),
+    ("UTILITIES_PROCEED", "Utilities_Display"),
+    ("MORTGAGE_INTEREST_PROCEED", "MortgageInterest_Display"),
+    ("HEALTH_CARE_PROCEED", "HealthCare_Display"),
+    ("RENT_PROCEED", "Rent_Display"),
+    ("REFINANCE_EIDL_PROCEED", "RefinanceEidl_Display"),
+    ("DEBT_INTEREST_PROCEED", "DebtInterest_Display"),
 )
+
+# AP style spells out March–July and abbreviates the rest (e.g. Feb., Sept.).
+_AP_MONTH_NAMES = {
+    1: "Jan.",
+    2: "Feb.",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "Aug.",
+    9: "Sept.",
+    10: "Oct.",
+    11: "Nov.",
+    12: "Dec.",
+}
 
 # Markers Fabric uses when mssparkutils.fs.ls returns absolute mount paths.
 _LAKEHOUSE_FILE_MARKERS = ("/Files/", "/files/")
@@ -179,6 +257,8 @@ def resolve_csv_paths(csv_path: str) -> tuple[str, list[str]]:
     Resolve csv_path to concrete CSV file paths.
 
     - If csv_path ends with .csv, use that file directly.
+    - If csv_path is a directory that directly contains .csv files (e.g. the
+      download target), load every .csv file in it.
     - Otherwise treat csv_path as a base directory, pick the latest subfolder
       (by modify time), and load every .csv file in that subfolder.
     """
@@ -186,9 +266,11 @@ def resolve_csv_paths(csv_path: str) -> tuple[str, list[str]]:
     if normalized.lower().endswith(".csv"):
         return normalized, [normalized]
 
-    latest_dir = _find_latest_subdirectory(normalized)
-    csv_files = _list_csv_files(latest_dir)
-    return latest_dir, csv_files
+    try:
+        return normalized, _list_csv_files(normalized)
+    except ValueError:
+        latest_dir = _find_latest_subdirectory(normalized)
+        return latest_dir, _list_csv_files(latest_dir)
 
 
 def _clean_location_field(column):
@@ -210,6 +292,216 @@ def _currency_display(amount_column):
         amount_column.isNull(),
         F.lit("$0"),
     ).otherwise(F.concat(F.lit("$"), F.format_number(rounded, 0)))
+
+
+def _ap_month(date_column):
+    """Month in AP style: 'Feb.', 'March', 'June', 'Sept.', etc."""
+    month = F.month(date_column)
+    column = None
+    for number, label in _AP_MONTH_NAMES.items():
+        condition = month == number
+        column = (
+            F.when(condition, F.lit(label))
+            if column is None
+            else column.when(condition, F.lit(label))
+        )
+    return column
+
+
+def _ap_date_display(date_column):
+    """Format a date in AP style, e.g. 'Feb. 13, 2021' or 'June 29, 2022'."""
+    return F.concat(
+        _ap_month(date_column),
+        F.lit(" "),
+        F.date_format(date_column, "d, yyyy"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Download (data.sba.gov / CKAN) — discover resources, then stream to disk
+# ---------------------------------------------------------------------------
+def _human_bytes(num_bytes: float) -> str:
+    """Format a byte count as a short human-readable string (e.g. '431.2 MB')."""
+    value = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def fetch_dataset_resources(
+    dataset_id: str | None = None,
+    ckan_api_base: str | None = None,
+    formats=_UNSET,
+) -> list[dict]:
+    """
+    Look up the dataset via the CKAN package_show API and return its files.
+
+    Each item is {name, url, size, format}. `formats` filters by CKAN format
+    (case-insensitive); pass None/() to return every resource.
+    """
+    dataset_id = SBA_DATASET_ID if dataset_id is None else dataset_id
+    ckan_api_base = SBA_CKAN_API_BASE if ckan_api_base is None else ckan_api_base
+    formats = DOWNLOAD_FORMATS if formats is _UNSET else formats
+
+    api_url = (
+        f"{ckan_api_base.rstrip('/')}/package_show"
+        f"?id={urllib.parse.quote(dataset_id)}"
+    )
+    request = urllib.request.Request(
+        api_url, headers={"User-Agent": _DOWNLOAD_USER_AGENT}
+    )
+    with urllib.request.urlopen(request) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if not payload.get("success"):
+        raise RuntimeError(f"CKAN package_show failed for dataset {dataset_id!r}")
+
+    wanted = {fmt.upper() for fmt in formats} if formats else None
+    resources: list[dict] = []
+    for resource in payload["result"]["resources"]:
+        fmt = (resource.get("format") or "").upper()
+        if wanted is not None and fmt not in wanted:
+            continue
+        resources.append(
+            {
+                "name": resource.get("name") or resource["id"],
+                "url": resource["url"],
+                "size": resource.get("size"),
+                "format": fmt,
+            }
+        )
+    return resources
+
+
+def download_file(
+    url: str,
+    dest_path: str,
+    expected_size: int | None = None,
+    overwrite: bool | None = None,
+    chunk_bytes: int | None = None,
+) -> str:
+    """
+    Stream `url` to `dest_path`. Writes to a .part file then atomically renames.
+
+    Skips the download when a same-size file already exists (unless overwrite).
+    """
+    overwrite = DOWNLOAD_OVERWRITE if overwrite is None else overwrite
+    chunk_bytes = DOWNLOAD_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    name = os.path.basename(dest_path)
+
+    if (
+        not overwrite
+        and expected_size
+        and os.path.exists(dest_path)
+        and os.path.getsize(dest_path) == expected_size
+    ):
+        print(f"  - skip (already downloaded): {name}")
+        return dest_path
+
+    tmp_path = f"{dest_path}.part"
+    request = urllib.request.Request(
+        url, headers={"User-Agent": _DOWNLOAD_USER_AGENT}
+    )
+    downloaded = 0
+    last_report = time.monotonic()
+    with urllib.request.urlopen(request) as response, open(tmp_path, "wb") as handle:
+        while True:
+            chunk = response.read(chunk_bytes)
+            if not chunk:
+                break
+            handle.write(chunk)
+            downloaded += len(chunk)
+            now = time.monotonic()
+            if now - last_report >= 2:
+                if expected_size:
+                    pct = downloaded / expected_size * 100
+                    print(
+                        f"    {name}: {pct:5.1f}% "
+                        f"({_human_bytes(downloaded)} / {_human_bytes(expected_size)})"
+                    )
+                else:
+                    print(f"    {name}: {_human_bytes(downloaded)}")
+                last_report = now
+
+    os.replace(tmp_path, dest_path)
+    print(f"  - done: {name} ({_human_bytes(downloaded)})")
+    return dest_path
+
+
+def download_dataset(
+    download_dir: str | None = None,
+    dataset_id: str | None = None,
+    ckan_api_base: str | None = None,
+    formats=_UNSET,
+    overwrite: bool | None = None,
+    file_limit: int | None = _UNSET,
+    chunk_bytes: int | None = None,
+    max_workers: int | None = None,
+) -> str:
+    """
+    Download the PPP FOIA files from data.sba.gov into `download_dir`.
+
+    Files are fetched concurrently (network I/O-bound) with up to `max_workers`
+    threads. Returns the directory containing the files (ready as csv_path).
+    """
+    download_dir = DOWNLOAD_DIR if download_dir is None else download_dir
+    file_limit = DOWNLOAD_FILE_LIMIT if file_limit is _UNSET else file_limit
+    max_workers = DOWNLOAD_MAX_WORKERS if max_workers is None else max_workers
+
+    os.makedirs(download_dir, exist_ok=True)
+    resources = fetch_dataset_resources(dataset_id, ckan_api_base, formats)
+    if file_limit is not None:
+        resources = resources[:file_limit]
+    if not resources:
+        raise ValueError(
+            "No matching resources to download (check DOWNLOAD_FORMATS)."
+        )
+
+    total = len(resources)
+    total_size = sum(resource["size"] or 0 for resource in resources)
+    worker_count = max(1, min(max_workers, total))
+    print(
+        f"Downloading {total} file(s) (~{_human_bytes(total_size)}) to "
+        f"{download_dir} using {worker_count} parallel worker(s)"
+    )
+
+    def _download_one(index: int, resource: dict) -> str:
+        dest = os.path.join(download_dir, resource["name"])
+        print(
+            f"[{index}/{total}] start {resource['name']} "
+            f"({_human_bytes(resource['size'] or 0)})"
+        )
+        return download_file(
+            resource["url"],
+            dest,
+            expected_size=resource["size"],
+            overwrite=overwrite,
+            chunk_bytes=chunk_bytes,
+        )
+
+    errors: list[tuple[str, BaseException]] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_resource = {
+            executor.submit(_download_one, index, resource): resource
+            for index, resource in enumerate(resources, start=1)
+        }
+        for future in as_completed(future_to_resource):
+            resource = future_to_resource[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 — collect and report all failures
+                errors.append((resource["name"], exc))
+                print(f"  - FAILED: {resource['name']}: {exc}")
+
+    if errors:
+        names = ", ".join(name for name, _ in errors)
+        raise RuntimeError(
+            f"Failed to download {len(errors)} of {total} file(s): {names}"
+        )
+
+    return download_dir
 
 
 def read_ppp_csv(
@@ -261,9 +553,7 @@ def transform_ppp(df: DataFrame) -> DataFrame:
 
     forgiven_display = F.concat(
         F.lit("Forgiven as of "),
-        F.date_format(F.col("ForgivenessDate"), "MMM"),
-        F.lit(". "),
-        F.date_format(F.col("ForgivenessDate"), "d, yyyy"),
+        _ap_date_display(F.col("ForgivenessDate")),
     )
 
     loan_status_display = (
@@ -275,9 +565,9 @@ def transform_ppp(df: DataFrame) -> DataFrame:
         .otherwise(F.coalesce(F.col("LoanStatus"), F.lit("Unknown")))
     )
 
-    df = df.withColumn("Recipient", F.upper(F.trim(F.col("BorrowerName"))))
+    df = df.withColumn("Recipient_Display", F.upper(F.trim(F.col("BorrowerName"))))
     df = df.withColumn(
-        "Location",
+        "Location_Display",
         F.when(
             city.isNull() & state.isNull(),
             F.lit(None),
@@ -290,30 +580,39 @@ def transform_ppp(df: DataFrame) -> DataFrame:
         ),
     )
     df = df.withColumn(
-        "AreaType",
+        "AreaType_Display",
         F.when(F.col("RuralUrbanIndicator") == "U", F.lit("Urban"))
         .when(F.col("RuralUrbanIndicator") == "R", F.lit("Rural"))
         .otherwise(F.lit(None)),
     )
-    df = df.withColumn("Lender", F.coalesce(F.col("OriginatingLender"), F.col("ServicingLenderName")))
-    df = df.withColumn("BusinessAge", F.col("BusinessAgeDescription"))
-    df = df.withColumn("Industry", F.col("NAICSCode").cast("string"))
-    df = df.withColumn("JobsReportedDisplay", F.col("JobsReported").cast("string"))
-    df = df.withColumn("BusinessTypeDisplay", F.trim(F.col("BusinessType")))
-    df = df.withColumn("LoanAmount", _currency_display(F.col("CurrentApprovalAmount")))
+    df = df.withColumn("Lender_Display", F.coalesce(F.col("OriginatingLender"), F.col("ServicingLenderName")))
+    df = df.withColumn("BusinessAge_Display", F.col("BusinessAgeDescription"))
+    # NOTE: source CSV has only NAICSCode (no industry title); displays the code,
+    # not the description (e.g. "722513" rather than "Limited-Service Restaurants").
+    df = df.withColumn("Industry_Display", F.col("NAICSCode").cast("string"))
+    df = df.withColumn("JobsReported_Display", F.col("JobsReported").cast("string"))
+    df = df.withColumn("BusinessType_Display", F.trim(F.col("BusinessType")))
+    df = df.withColumn("LoanAmount_Display", _currency_display(F.col("CurrentApprovalAmount")))
     df = df.withColumn(
-        "DateApprovedDisplay",
+        "ForgivenessAmount_Display",
+        F.when(
+            F.col("ForgivenessAmount").isNull(),
+            F.lit(None),
+        ).otherwise(_currency_display(F.col("ForgivenessAmount"))),
+    )
+    df = df.withColumn(
+        "DateApproved_Display",
         F.when(
             F.col("DateApproved").isNull(),
             F.lit(None),
         ).otherwise(
             F.concat(
-                F.date_format(F.col("DateApproved"), "MMMM d, yyyy"),
+                _ap_date_display(F.col("DateApproved")),
                 loan_round_suffix,
             )
         ),
     )
-    df = df.withColumn("LoanStatusDisplay", loan_status_display)
+    df = df.withColumn("LoanStatus_Display", loan_status_display)
 
     for source_col, display_col in PROCEED_COLUMNS:
         df = df.withColumn(display_col, _currency_display(F.col(source_col)))
@@ -339,25 +638,26 @@ def transform_ppp(df: DataFrame) -> DataFrame:
 
     output_columns = [
         "LoanNumber",
-        "Recipient",
-        "Location",
-        "AreaType",
-        "Lender",
-        "BusinessAge",
-        "Industry",
-        "JobsReportedDisplay",
-        "BusinessTypeDisplay",
-        "LoanAmount",
-        "DateApprovedDisplay",
-        "LoanStatusDisplay",
+        "Recipient_Display",
+        "Location_Display",
+        "AreaType_Display",
+        "Lender_Display",
+        "BusinessAge_Display",
+        "Industry_Display",
+        "JobsReported_Display",
+        "BusinessType_Display",
+        "LoanAmount_Display",
+        "ForgivenessAmount_Display",
+        "DateApproved_Display",
+        "LoanStatus_Display",
         "searchtext",
-        "PayrollDisplay",
-        "UtilitiesDisplay",
-        "MortgageInterestDisplay",
-        "HealthCareDisplay",
-        "RentDisplay",
-        "RefinanceEidlDisplay",
-        "DebtInterestDisplay",
+        "Payroll_Display",
+        "Utilities_Display",
+        "MortgageInterest_Display",
+        "HealthCare_Display",
+        "Rent_Display",
+        "RefinanceEidl_Display",
+        "DebtInterest_Display",
         "CurrentApprovalAmount",
         "InitialApprovalAmount",
         "ForgivenessAmount",
@@ -620,23 +920,72 @@ def write_to_kusto_full_refresh(
         )
 
 
+def write_to_lakehouse_table(
+    df: DataFrame,
+    table: str,
+    mode: str = "overwrite",
+) -> None:
+    """
+    Full-refresh a managed Delta table in the attached default lakehouse.
+
+    Uses overwrite + overwriteSchema so a changed output schema replaces the
+    table cleanly (mirrors the Eventhouse full-refresh semantics). Writes to
+    Tables/<table> via the Spark metastore (saveAsTable).
+    """
+    (
+        df.write.format("delta")
+        .mode(mode)
+        .option("overwriteSchema", "true")
+        .saveAsTable(table)
+    )
+
+
 def run_pipeline(
     spark: SparkSession,
-    csv_path: str = CSV_PATH,
-    kusto_uri: str = KUSTO_URI,
-    kusto_database: str = KUSTO_DATABASE,
-    kusto_table: str = KUSTO_TABLE,
-    row_limit: int | None = ROW_LIMIT,
-    write_to_eventhouse: bool = True,
+    csv_path: str | None = None,
+    kusto_uri: str | None = None,
+    kusto_database: str | None = None,
+    kusto_table: str | None = None,
+    lakehouse_table: str | None = None,
+    row_limit: int | None = _UNSET,
+    download_first: bool | None = None,
+    write_to_eventhouse: bool | None = None,
+    write_to_lakehouse: bool | None = None,
     write_staging: bool | None = None,
     spark_shuffle_partitions: int | None = None,
 ) -> DataFrame:
-    """Read CSV, transform, optionally full-refresh write to the target KQL table."""
+    """Optionally download, then read CSV, transform, and full-refresh the targets.
+
+    The transformed DataFrame is written to the Eventhouse (KQL) table and/or a
+    lakehouse Delta table. When both targets are enabled the DataFrame is cached
+    and materialized once, so the CSV read + transforms aren't recomputed per write.
+
+    Unset arguments fall back to the CONFIGURATION values at the top of the file,
+    so they pick up edits/reassignments made before the call.
+    """
+    csv_path = CSV_PATH if csv_path is None else csv_path
+    kusto_uri = KUSTO_URI if kusto_uri is None else kusto_uri
+    kusto_database = KUSTO_DATABASE if kusto_database is None else kusto_database
+    kusto_table = KUSTO_TABLE if kusto_table is None else kusto_table
+    lakehouse_table = LAKEHOUSE_TABLE if lakehouse_table is None else lakehouse_table
+    row_limit = ROW_LIMIT if row_limit is _UNSET else row_limit
+    download_first = DOWNLOAD_BEFORE_RUN if download_first is None else download_first
+    write_to_eventhouse = (
+        WRITE_TO_EVENTHOUSE if write_to_eventhouse is None else write_to_eventhouse
+    )
+    write_to_lakehouse = (
+        WRITE_TO_LAKEHOUSE if write_to_lakehouse is None else write_to_lakehouse
+    )
+
     if write_staging is not None:
         write_to_eventhouse = write_staging
 
     if spark_shuffle_partitions is None:
-        spark_shuffle_partitions = globals().get("SPARK_SHUFFLE_PARTITIONS", 200)
+        spark_shuffle_partitions = SPARK_SHUFFLE_PARTITIONS
+
+    if download_first:
+        csv_path = download_dataset()
+
     raw = read_ppp_csv(
         spark,
         csv_path,
@@ -645,43 +994,64 @@ def run_pipeline(
     )
     df = transform_ppp(raw)
 
-    if write_to_eventhouse:
-        if not kusto_uri or not kusto_database:
-            raise ValueError("Set kusto_uri and kusto_database before writing to Eventhouse")
-        print(f"Full refresh: clear + append to '{kusto_table}'...")
-        write_to_kusto_full_refresh(
-            df,
-            kusto_uri,
-            kusto_database,
-            kusto_table,
-            spark_shuffle_partitions=spark_shuffle_partitions,
-        )
+    # Cache + materialize once when feeding multiple sinks so the (expensive)
+    # CSV read and transforms run a single time instead of once per write.
+    cached = write_to_eventhouse and write_to_lakehouse
+    if cached:
+        df = df.cache()
+        row_count = df.count()  # action that populates the cache before writes
+        print(f"Cached {row_count:,} transformed rows for multi-target write.")
+
+    try:
+        if write_to_eventhouse:
+            if not kusto_uri or not kusto_database:
+                raise ValueError(
+                    "Set kusto_uri and kusto_database before writing to Eventhouse"
+                )
+            print(f"Full refresh: clear + append to Eventhouse '{kusto_table}'...")
+            write_to_kusto_full_refresh(
+                df,
+                kusto_uri,
+                kusto_database,
+                kusto_table,
+                spark_shuffle_partitions=spark_shuffle_partitions,
+            )
+
+        if write_to_lakehouse:
+            print(f"Full refresh: overwrite lakehouse table '{lakehouse_table}'...")
+            write_to_lakehouse_table(df, lakehouse_table)
+    finally:
+        if cached:
+            df.unpersist()
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Fabric notebook — set config in a prior cell, then:
+# Fabric notebook — edit the CONFIGURATION block at the top, then:
 #   !pip install azure-kusto-data --quiet   # once per environment
 #   %run ppp_foia_to_eventhouse
-#   df = run_pipeline(spark)
+#   download_dataset()                       # pull CSVs from data.sba.gov
+#   df = run_pipeline(spark)                 # or run_pipeline(spark, download_first=True)
 #   df.show(5, truncate=False)
 # ---------------------------------------------------------------------------
 
 # =============================================================================
 # VALIDATION (sample run)
 # =============================================================================
-# 1. Set csv_path (CSV_PATH) to a folder or a single .csv file in a prior cell.
-# 2. Set write_to_eventhouse=False to inspect:
-#      df = run_pipeline(spark, write_to_eventhouse=False)
+# 1. Point CSV_PATH at the download folder, a dated subfolder, or a single .csv.
+# 2. Disable the writes to inspect only:
+#      df = run_pipeline(spark, write_to_eventhouse=False, write_to_lakehouse=False)
 # 3. Checks on sample data:
-#    - Recipient is uppercase (e.g. NORTH CHARLESTON HOSPITALITY GROUP LLC)
-#    - LoanStatusDisplay starts with "Forgiven as of" when ForgivenessDate is set
+#    - Recipient_Display is uppercase (e.g. NORTH CHARLESTON HOSPITALITY GROUP LLC)
+#    - LoanStatus_Display starts with "Forgiven as of" when ForgivenessDate is set
+#      (AP style months, e.g. "Forgiven as of June 29, 2022")
 #    - searchtext contains "synovus" and zip fragment "29456" for row 9677497701
 #
-# Full run: restore full CSV path, ROW_LIMIT=None, write_to_eventhouse=True.
-# If the output schema changes, drop the target table once in Eventhouse query UI,
-# then re-run so CreateIfNotExist recreates it from the DataFrame schema.
+# Full run: restore full CSV path, ROW_LIMIT=None, both writes enabled.
+# If the output schema changes: for Eventhouse, drop the target table once in the
+# query UI so CreateIfNotExist recreates it; the lakehouse write uses
+# overwriteSchema and replaces the Delta table schema automatically.
 #
 # =============================================================================
 # POWER BI — single search bar on searchtext
@@ -694,7 +1064,9 @@ def run_pipeline(
 #       IF ( q = "", TRUE(), CONTAINSSTRING ( ppp_loans[searchtext], q ) )
 #
 # Or as a table filter: keep rows where CONTAINSSTRING(ppp_loans[searchtext], LOWER(q)).
-# Bind list cards to: Recipient, Location, LoanStatusDisplay, LoanAmount,
-# DateApprovedDisplay; detail page uses proceed *Display columns and Lender, AreaType,
-# BusinessAge, Industry (NAICS code), BusinessTypeDisplay, JobsReportedDisplay.
+# Bind list cards to: Recipient_Display, Location_Display, LoanStatus_Display,
+# LoanAmount_Display, DateApproved_Display; detail page uses the proceed *_Display
+# columns plus ForgivenessAmount_Display, Lender_Display, AreaType_Display,
+# BusinessAge_Display, Industry_Display (NAICS code), BusinessType_Display,
+# JobsReported_Display.
 # =============================================================================
